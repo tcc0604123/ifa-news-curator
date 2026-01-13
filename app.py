@@ -37,7 +37,7 @@ def fetch_news():
     for category, url in urls:
         try:
             feed = feedparser.parse(url)
-            for entry in feed.entries[:10]: # 減少每類抓取量以加快速度
+            for entry in feed.entries[:10]: 
                 news_items.append({
                     "category": category,
                     "title": entry.title,
@@ -50,26 +50,64 @@ def fetch_news():
             
     return news_items
 
-def get_working_model():
+def detect_and_generate(prompt):
     """
-    【核心修復】模型輪盤：自動嘗試所有可能的模型名稱
-    直到找到一個不會報錯的為止。
+    【核心修復】自動偵測模型並生成
+    不再猜測模型名稱，而是直接讀取 list_models() 的結果。
     """
-    candidate_models = [
-        "gemini-1.5-flash",          # 最新標準名
-        "gemini-1.5-flash-latest",   # 變體名
-        "models/gemini-1.5-flash",   # 帶前綴名
-        "gemini-pro",                # 舊版穩定名
-        "models/gemini-pro",         # 舊版帶前綴
-        "gemini-1.0-pro"             # 原始版
-    ]
-    
-    # 這裡我們只回傳一個基礎物件，真正的測試在 generate_content 時
-    # 為了節省時間，我們預設先用第一個，但在執行時做錯誤攔截
-    return candidate_models
+    try:
+        # 1. 直接問 Google 有哪些模型
+        available_models = []
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                available_models.append(m.name)
+        
+        # 顯示在終端機以便除錯
+        print(f"偵測到的可用模型: {available_models}")
+
+        # 2. 優先順序策略 (避免用到 2.5 這種沒額度的)
+        # 我們要找包含 'flash' 或 'pro' 但不包含 '2.5' 的模型
+        chosen_model = None
+        
+        # 策略 A: 找 Flash (最快)
+        for m in available_models:
+            if "flash" in m and "2.5" not in m:
+                chosen_model = m
+                break
+        
+        # 策略 B: 找 Pro (次選)
+        if not chosen_model:
+            for m in available_models:
+                if "pro" in m and "2.5" not in m:
+                    chosen_model = m
+                    break
+        
+        # 策略 C: 隨便找一個 (只要不是 2.5)
+        if not chosen_model:
+            for m in available_models:
+                if "2.5" not in m:
+                    chosen_model = m
+                    break
+        
+        # 策略 D: 真的沒魚蝦也好，就用第一個
+        if not chosen_model and available_models:
+            chosen_model = available_models[0]
+            
+        if not chosen_model:
+            return None, "找不到任何可用模型 (ListModels returned empty)"
+
+        print(f"最終決定使用: {chosen_model}")
+        
+        # 3. 執行生成
+        model = genai.GenerativeModel(chosen_model)
+        response = model.generate_content(prompt)
+        return response.text, None
+
+    except Exception as e:
+        return None, str(e)
 
 def batch_generate_comments(selected_news):
-    """批次生成評論 (包含重試機制)"""
+    """批次生成評論"""
     
     # 準備給 AI 的資料包
     news_text_block = json.dumps([{
@@ -94,42 +132,24 @@ def batch_generate_comments(selected_news):
     }}
     """
     
-    # 取得候選模型清單
-    candidates = get_working_model()
-    last_error = ""
+    # 使用新的自動偵測函數
+    result_text, error = detect_and_generate(prompt)
+    
+    if error:
+        # 如果是 429 錯誤，提示使用者
+        if "429" in str(error):
+            st.warning("⚠️ Google API 忙碌中 (429 Rate Limit)。請稍候再試。")
+        else:
+            st.error(f"AI 生成失敗: {error}")
+        return []
 
-    # 【關鍵迴圈】一個一個試，直到成功
-    for model_name in candidates:
-        try:
-            # 嘗試建立模型
-            model = genai.GenerativeModel(model_name)
-            # 嘗試生成內容
-            response = model.generate_content(prompt)
-            
-            # 如果成功執行到這裡，代表這個模型名稱是對的！
-            cleaned_text = response.text.replace("```json", "").replace("```", "").strip()
-            comments_data = json.loads(cleaned_text)
-            
-            # 成功後直接回傳，並在 Console 印出是用哪個模型成功的
-            print(f"SUCCESS with model: {model_name}")
-            return comments_data
-            
-        except Exception as e:
-            error_msg = str(e)
-            print(f"Failed with {model_name}: {error_msg}")
-            
-            # 如果是 429 (額度滿)，這不是名字錯，要休息一下再試
-            if "429" in error_msg:
-                time.sleep(2)
-                continue # 換下一個模型試試看運氣
-                
-            # 如果是 404 (名字錯)，直接換下一個
-            last_error = error_msg
-            continue
-
-    # 如果全部都試失敗了
-    st.error(f"所有 AI 模型都無法連線。最後一次錯誤: {last_error}")
-    return []
+    try:
+        cleaned_text = result_text.replace("```json", "").replace("```", "").strip()
+        comments_data = json.loads(cleaned_text)
+        return comments_data
+    except Exception as e:
+        st.error(f"JSON 解析失敗: {e}")
+        return []
 
 # ==========================================
 # 3. 整合流程 (加上快取機制)
@@ -144,12 +164,11 @@ def run_curation_pipeline(api_key):
     if not raw_news:
         return None, "無法抓取新聞"
 
-    # 2. 多樣性篩選 (Python 邏輯)
+    # 2. 多樣性篩選
     selected_news = []
     seen_titles = set()
     categories = ["稅務與法規", "退休與年金", "投資與ETF", "房產與保險"]
     
-    # 確保每個分類至少有一篇
     while len(selected_news) < 6 and raw_news:
         for cat in categories:
             candidates = [n for n in raw_news if n['category'] == cat and n['title'] not in seen_titles]
@@ -166,7 +185,7 @@ def run_curation_pipeline(api_key):
             selected_news.append(pick)
             seen_titles.add(pick['title'])
 
-    # 3. 批次生成評論 (這步最容易錯，現在有輪盤保護)
+    # 3. 批次生成評論
     comments_data = batch_generate_comments(selected_news)
     
     # 4. 組合結果
@@ -202,30 +221,31 @@ def main():
         return
 
     if st.button("開始策展 (更新日報)"):
-        with st.spinner("AI 正在嘗試連接最佳模型並整理新聞..."):
-            results, error = run_curation_pipeline(api_key)
-            
-            if error:
-                st.error(error)
-            else:
-                st.success(f"策展完成！資料來源：Google News")
+        with st.spinner("AI 正在偵測可用模型並整理新聞..."):
+            # 這裡的 try-catch 是為了防止 list_models 本身報錯
+            try:
+                results, error = run_curation_pipeline(api_key)
                 
-                st.divider()
-                cols = st.columns(2)
-                
-                for idx, item in enumerate(results):
-                    news = item['news']
-                    comment = item['comment']
+                if error:
+                    st.error(error)
+                else:
+                    st.success(f"策展完成！資料來源：Google News")
+                    st.divider()
+                    cols = st.columns(2)
                     
-                    with cols[idx % 2]:
-                        with st.container(border=True):
-                            st.subheader(news['title'])
-                            st.caption(f"由 {news['source']} 發布於 {news['category']}")
-                            
-                            advisor_view = "\n".join([f"- {p}" for p in comment.get('advisor_view', [])]) if comment else "AI 生成中斷"
-                            action = comment.get('action', '建議詳閱原文') if comment else ""
-                            
-                            content = f"""
+                    for idx, item in enumerate(results):
+                        news = item['news']
+                        comment = item['comment']
+                        
+                        with cols[idx % 2]:
+                            with st.container(border=True):
+                                st.subheader(news['title'])
+                                st.caption(f"由 {news['source']} 發布於 {news['category']}")
+                                
+                                advisor_view = "\n".join([f"- {p}" for p in comment.get('advisor_view', [])]) if comment else "AI 生成中斷"
+                                action = comment.get('action', '建議詳閱原文') if comment else ""
+                                
+                                content = f"""
 ### 💼 顧問觀點
 {advisor_view}
 
@@ -234,9 +254,11 @@ def main():
 
 [閱讀原文]({news['link']})
 """
-                            st.markdown(content)
-                            with st.expander("複製文案"):
-                                st.code(f"{news['title']}\n\n{content}", language="markdown")
+                                st.markdown(content)
+                                with st.expander("複製文案"):
+                                    st.code(f"{news['title']}\n\n{content}", language="markdown")
+            except Exception as e:
+                st.error(f"發生未預期的錯誤: {e}")
 
 if __name__ == "__main__":
     main()
