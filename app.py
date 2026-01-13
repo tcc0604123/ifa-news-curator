@@ -11,7 +11,7 @@ import ssl
 # ==========================================
 st.set_page_config(page_title="IFA 智能新聞策展", layout="wide")
 
-# 強制忽略 SSL 憑證檢查 (解決 RSS 抓取失敗問題)
+# 強制忽略 SSL 憑證檢查
 try:
     _create_unverified_https_context = ssl._create_unverified_context
 except AttributeError:
@@ -27,7 +27,6 @@ def fetch_news():
     """抓取 Google News RSS 新聞"""
     news_items = []
     
-    # 針對台灣理財的關鍵字搜尋 RSS
     urls = [
         ("稅務與法規", "https://news.google.com/rss/search?q=台灣+稅務+OR+房地合一+OR+所得稅+when:1d&hl=zh-TW&gl=TW&ceid=TW:zh-TW"),
         ("退休與年金", "https://news.google.com/rss/search?q=台灣+退休金+OR+勞保+OR+勞退+when:1d&hl=zh-TW&gl=TW&ceid=TW:zh-TW"),
@@ -38,8 +37,7 @@ def fetch_news():
     for category, url in urls:
         try:
             feed = feedparser.parse(url)
-            # 每一類抓前 15 篇，確保原料充足
-            for entry in feed.entries[:15]:
+            for entry in feed.entries[:10]: # 減少每類抓取量以加快速度
                 news_items.append({
                     "category": category,
                     "title": entry.title,
@@ -52,19 +50,27 @@ def fetch_news():
             
     return news_items
 
-def batch_generate_comments(selected_news):
-    """批次生成評論"""
+def get_working_model():
+    """
+    【核心修復】模型輪盤：自動嘗試所有可能的模型名稱
+    直到找到一個不會報錯的為止。
+    """
+    candidate_models = [
+        "gemini-1.5-flash",          # 最新標準名
+        "gemini-1.5-flash-latest",   # 變體名
+        "models/gemini-1.5-flash",   # 帶前綴名
+        "gemini-pro",                # 舊版穩定名
+        "models/gemini-pro",         # 舊版帶前綴
+        "gemini-1.0-pro"             # 原始版
+    ]
     
-    # 【關鍵修正】強制指定使用 gemini-1.5-flash
-    # 這個模型每天有 1,500 次免費額度，且速度最快
-    model_name = "gemini-1.5-flash"
-    
-    try:
-        model = genai.GenerativeModel(model_name)
-    except Exception:
-        # 如果 flash 真的也不能用，退回舊版 pro
-        model = genai.GenerativeModel("gemini-pro")
+    # 這裡我們只回傳一個基礎物件，真正的測試在 generate_content 時
+    # 為了節省時間，我們預設先用第一個，但在執行時做錯誤攔截
+    return candidate_models
 
+def batch_generate_comments(selected_news):
+    """批次生成評論 (包含重試機制)"""
+    
     # 準備給 AI 的資料包
     news_text_block = json.dumps([{
         "id": i, 
@@ -88,19 +94,42 @@ def batch_generate_comments(selected_news):
     }}
     """
     
-    try:
-        response = model.generate_content(prompt)
-        # 清理回傳字串
-        cleaned_text = response.text.replace("```json", "").replace("```", "").strip()
-        comments_data = json.loads(cleaned_text)
-        return comments_data
-    except Exception as e:
-        # 如果還是遇到 429 錯誤，在這裡攔截並顯示友善訊息
-        if "429" in str(e):
-            st.warning("⚠️ 系統忙碌中 (API 額度限制)。請稍等 1 分鐘後再試。")
-        else:
-            st.error(f"AI 生成失敗: {e}")
-        return []
+    # 取得候選模型清單
+    candidates = get_working_model()
+    last_error = ""
+
+    # 【關鍵迴圈】一個一個試，直到成功
+    for model_name in candidates:
+        try:
+            # 嘗試建立模型
+            model = genai.GenerativeModel(model_name)
+            # 嘗試生成內容
+            response = model.generate_content(prompt)
+            
+            # 如果成功執行到這裡，代表這個模型名稱是對的！
+            cleaned_text = response.text.replace("```json", "").replace("```", "").strip()
+            comments_data = json.loads(cleaned_text)
+            
+            # 成功後直接回傳，並在 Console 印出是用哪個模型成功的
+            print(f"SUCCESS with model: {model_name}")
+            return comments_data
+            
+        except Exception as e:
+            error_msg = str(e)
+            print(f"Failed with {model_name}: {error_msg}")
+            
+            # 如果是 429 (額度滿)，這不是名字錯，要休息一下再試
+            if "429" in error_msg:
+                time.sleep(2)
+                continue # 換下一個模型試試看運氣
+                
+            # 如果是 404 (名字錯)，直接換下一個
+            last_error = error_msg
+            continue
+
+    # 如果全部都試失敗了
+    st.error(f"所有 AI 模型都無法連線。最後一次錯誤: {last_error}")
+    return []
 
 # ==========================================
 # 3. 整合流程 (加上快取機制)
@@ -108,9 +137,6 @@ def batch_generate_comments(selected_news):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def run_curation_pipeline(api_key):
-    """
-    1小時內只執行一次，大幅節省額度
-    """
     genai.configure(api_key=api_key)
     
     # 1. 抓取新聞
@@ -123,6 +149,7 @@ def run_curation_pipeline(api_key):
     seen_titles = set()
     categories = ["稅務與法規", "退休與年金", "投資與ETF", "房產與保險"]
     
+    # 確保每個分類至少有一篇
     while len(selected_news) < 6 and raw_news:
         for cat in categories:
             candidates = [n for n in raw_news if n['category'] == cat and n['title'] not in seen_titles]
@@ -131,88 +158,3 @@ def run_curation_pipeline(api_key):
                 selected_news.append(pick)
                 seen_titles.add(pick['title'])
                 if len(selected_news) >= 6: break
-        
-        if len(selected_news) < 6:
-            remaining = [n for n in raw_news if n['title'] not in seen_titles]
-            if not remaining: break
-            pick = remaining[0]
-            selected_news.append(pick)
-            seen_titles.add(pick['title'])
-
-    # 3. 批次生成評論
-    comments_data = batch_generate_comments(selected_news)
-    
-    # 4. 組合結果
-    final_results = []
-    for news in selected_news:
-        comment = next((c for c in comments_data if c.get('title') == news['title'] or c.get('id') == selected_news.index(news)), None)
-        if not comment and len(comments_data) > selected_news.index(news):
-            comment = comments_data[selected_news.index(news)]
-
-        final_results.append({
-            "news": news,
-            "comment": comment
-        })
-        
-    return final_results, None
-
-# ==========================================
-# 4. 主程式介面 (UI)
-# ==========================================
-
-def main():
-    st.title("🤖 IFA 智能新聞策展系統")
-    st.caption("自動彙整稅務、退休、投資與房產資訊，生成顧問觀點。")
-
-    # 處理 API Key
-    api_key = None
-    if "GOOGLE_API_KEY" in st.secrets:
-        api_key = st.secrets["GOOGLE_API_KEY"]
-    else:
-        api_key = st.sidebar.text_input("請輸入 Google API Key", type="password")
-
-    if not api_key:
-        st.warning("請先設定 API Key 才能開始運作。")
-        return
-
-    # 按鈕觸發
-    if st.button("開始策展 (更新日報)"):
-        with st.spinner("AI 正在閱讀並整理全台財經新聞... (約需 10-20 秒)"):
-            results, error = run_curation_pipeline(api_key)
-            
-            if error:
-                st.error(error)
-            else:
-                st.toast(f"資料來源：Google News | 更新時間：{time.strftime('%H:%M')}")
-                
-                # 顯示結果 (雙欄排版)
-                st.divider()
-                cols = st.columns(2)
-                
-                for idx, item in enumerate(results):
-                    news = item['news']
-                    comment = item['comment']
-                    
-                    with cols[idx % 2]:
-                        with st.container(border=True):
-                            st.subheader(news['title'])
-                            st.caption(f"由 {news['source']} 發布於 {news['category']}")
-                            
-                            advisor_view = "\n".join([f"- {p}" for p in comment.get('advisor_view', [])]) if comment else "AI 生成中斷"
-                            action = comment.get('action', '建議詳閱原文') if comment else ""
-                            
-                            content = f"""
-### 💼 顧問觀點
-{advisor_view}
-
-### 🚀 建議行動
-{action}
-
-[閱讀原文]({news['link']})
-"""
-                            st.markdown(content)
-                            with st.expander("複製文案"):
-                                st.code(f"{news['title']}\n\n{content}", language="markdown")
-
-if __name__ == "__main__":
-    main()
