@@ -158,3 +158,85 @@ def run_curation_pipeline(api_key):
                 selected_news.append(pick)
                 seen_titles.add(pick['title'])
                 if len(selected_news) >= 6: break
+        
+        if len(selected_news) < 6:
+            remaining = [n for n in raw_news if n['title'] not in seen_titles]
+            if not remaining: break
+            pick = remaining[0]
+            selected_news.append(pick)
+            seen_titles.add(pick['title'])
+
+    # 3. 批次生成評論 (這步最容易錯，現在有輪盤保護)
+    comments_data = batch_generate_comments(selected_news)
+    
+    # 4. 組合結果
+    final_results = []
+    for news in selected_news:
+        comment = next((c for c in comments_data if c.get('title') == news['title'] or c.get('id') == selected_news.index(news)), None)
+        if not comment and len(comments_data) > selected_news.index(news):
+            comment = comments_data[selected_news.index(news)]
+
+        final_results.append({
+            "news": news,
+            "comment": comment
+        })
+        
+    return final_results, None
+
+# ==========================================
+# 4. 主程式介面 (UI)
+# ==========================================
+
+def main():
+    st.title("🤖 IFA 智能新聞策展系統")
+    st.caption("自動彙整稅務、退休、投資與房產資訊，生成顧問觀點。")
+
+    api_key = None
+    if "GOOGLE_API_KEY" in st.secrets:
+        api_key = st.secrets["GOOGLE_API_KEY"]
+    else:
+        api_key = st.sidebar.text_input("請輸入 Google API Key", type="password")
+
+    if not api_key:
+        st.warning("請先設定 API Key 才能開始運作。")
+        return
+
+    if st.button("開始策展 (更新日報)"):
+        with st.spinner("AI 正在嘗試連接最佳模型並整理新聞..."):
+            results, error = run_curation_pipeline(api_key)
+            
+            if error:
+                st.error(error)
+            else:
+                st.success(f"策展完成！資料來源：Google News")
+                
+                st.divider()
+                cols = st.columns(2)
+                
+                for idx, item in enumerate(results):
+                    news = item['news']
+                    comment = item['comment']
+                    
+                    with cols[idx % 2]:
+                        with st.container(border=True):
+                            st.subheader(news['title'])
+                            st.caption(f"由 {news['source']} 發布於 {news['category']}")
+                            
+                            advisor_view = "\n".join([f"- {p}" for p in comment.get('advisor_view', [])]) if comment else "AI 生成中斷"
+                            action = comment.get('action', '建議詳閱原文') if comment else ""
+                            
+                            content = f"""
+### 💼 顧問觀點
+{advisor_view}
+
+### 🚀 建議行動
+{action}
+
+[閱讀原文]({news['link']})
+"""
+                            st.markdown(content)
+                            with st.expander("複製文案"):
+                                st.code(f"{news['title']}\n\n{content}", language="markdown")
+
+if __name__ == "__main__":
+    main()
